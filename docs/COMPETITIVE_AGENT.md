@@ -1,3 +1,5 @@
+> **Documento della versione originale ricevuta.** Il default attuale è descritto in [CONSERVATIVE_AGENT.md](CONSERVATIVE_AGENT.md); i benchmark originali non misurano la nuova versione.
+
 # CompetitiveAgent
 
 ## Scopo e compatibilità

@@ -30,16 +30,16 @@ class CompetitiveAgent(BaseAgent):
 
     def __init__(
         self,
-        pricing_mode: str = "hybrid",
-        ladder_levels: int = 3,
+        pricing_mode: str = "conservative",
+        ladder_levels: int = 1,
         bid_aggressiveness: float = 1.0,
         price_factor: float = 1.0,
         use_joint_planning: bool = True,
         use_demand_learning: bool = True,
-        tiered_bids: bool = True,
+        tiered_bids: bool = False,
         adaptive_budget: bool = True,
     ) -> None:
-        if pricing_mode not in {"adaptive", "margin", "ucb", "gp", "demand", "hybrid"}:
+        if pricing_mode not in {"conservative", "adaptive", "margin", "ucb", "gp", "demand", "hybrid"}:
             raise ValueError(f"unsupported pricing mode: {pricing_mode}")
         if ladder_levels not in {0, 1, 2, 3}:
             raise ValueError("ladder_levels must be 0, 1, 2, or 3")
@@ -88,17 +88,17 @@ class CompetitiveAgent(BaseAgent):
             self._team_id = next(iter(matching))
 
     def _own_auction_transactions(self, state: Observation):
-        if self._team_id is None:
-            return None
         transactions = state.auction_transactions[self._auction_count :]
         self._auction_count = len(state.auction_transactions)
+        if self._team_id is None:
+            return None
         return [item for item in transactions if item.buyer == self._team_id]
 
     def _own_sales_transactions(self, state: Observation):
-        if self._team_id is None:
-            return None
         transactions = state.sales_transactions[self._sales_count :]
         self._sales_count = len(state.sales_transactions)
+        if self._team_id is None:
+            return None
         return [item for item in transactions if item.seller == self._team_id]
 
     def _consume_feedback(self, state: Observation) -> None:
@@ -140,7 +140,7 @@ class CompetitiveAgent(BaseAgent):
                 units = min(offered, units)
                 if offered <= 0:
                     continue
-                observed_price = proceeds / units if units else listed_price
+                observed_price = listed_price
                 censored = offered > 0 and units >= offered
                 if self.use_demand_learning:
                     self.demand.model(good).update(
@@ -178,7 +178,7 @@ class CompetitiveAgent(BaseAgent):
         )
         if raw_stock > 2 * max(1, len(state.auction_lots)):
             share -= 0.06
-        return max(0.24, min(0.56, share))
+        return max(0.08, min(0.20, share))
 
     def _competition(self, state: Observation, good: str, prior: float) -> float:
         if len(state.public_inventories) <= 1:
@@ -253,11 +253,11 @@ class CompetitiveAgent(BaseAgent):
                 recipe_costs[recipe.output_good] = cost
 
         average_inputs = self._average_recipe_size(goods_config)
-        per_team_raw = sum(lot.quantity for lot in state.auction_lots) / team_count
-        total_target = max(2, min(24, int(per_team_raw / max(1.0, average_inputs) + 0.5)))
+        total_target = 24
         good_count = max(1, len(goods_config.finished_goods))
-        prior_per_good = max(0.75, total_target / good_count)
-        per_good_limit = max(2, min(12, ceil(2.2 * prior_per_good)))
+        # Supply is not demand. Probe one unit; expand only after real sales.
+        prior_per_good = 0.35
+        per_good_limit = 12
 
         prices: dict[str, float] = {}
         targets: dict[str, int] = {}
@@ -266,7 +266,7 @@ class CompetitiveAgent(BaseAgent):
             current = state.inventory.get(good, 0)
             model = self.demand.model(good)
             competition = self._competition(state, good, prior_per_good)
-            quote_stock = max(1, current + per_good_limit // 2)
+            quote_stock = max(1, current)
             price = self.pricing.quote(
                 good,
                 recipe_costs.get(good, 1.0),
@@ -283,14 +283,25 @@ class CompetitiveAgent(BaseAgent):
             else:
                 target = max(1, min(per_good_limit, ceil(prior_per_good)))
                 expected = prior_per_good
-            # Visible rival stock reduces new exposure, never below one unit.
-            target = max(1, min(per_good_limit, int(target / (1.0 + 0.28 * competition) + 0.75)))
+            target = max(0, min(per_good_limit, target))
             targets[good] = target
-            sale_probability = max(0.28, min(1.0, expected / max(1, target)))
+            sale_probability = min(1.0, expected / max(1, target))
             expected_unit_revenue[good] = price * sale_probability
 
         budget_share = self._budget_share(state, team_count)
-        planning_budget = max(0.0, state.capital * budget_share)
+        # Hard cash reserve: even a complete failure to sell cannot spend more
+        # than 3% of starting cash (assuming the official no-other-cost rules).
+        planning_budget = max(0.0, min(state.capital * budget_share,
+                                      state.capital - 0.97 * self._capital_anchor))
+        availability = {lot.good: lot.quantity for lot in state.auction_lots}
+        marginal_values = {}
+        for good in goods_config.finished_goods:
+            model = self.demand.model(good)
+            stock = int(state.inventory.get(good, 0))
+            marginal_values[good] = [
+                prices[good] * model.sale_probability(stock + k, prices[good], prior_per_good)
+                for k in range(1, per_good_limit + 1)
+            ]
         if self.use_joint_planning:
             plan = joint_plan(
                 goods_config.recipes,
@@ -301,6 +312,8 @@ class CompetitiveAgent(BaseAgent):
                 expected_unit_revenue,
                 planning_budget,
                 total_target,
+                available=availability,
+                marginal_values=marginal_values,
             )
         else:
             plan = greedy_plan(

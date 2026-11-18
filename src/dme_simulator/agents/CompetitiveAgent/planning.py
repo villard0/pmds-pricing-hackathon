@@ -43,6 +43,8 @@ def joint_plan(
     budget: float,
     total_limit: int,
     beam_width: int = 96,
+    available: dict[str, int] | None = None,
+    marginal_values: dict[str, list[float]] | None = None,
 ) -> Plan:
     """Choose a whole recipe portfolio, not independent material purchases.
 
@@ -79,13 +81,25 @@ def joint_plan(
                 candidate = dict(quantities)
                 candidate[recipe_name] = quantity
                 required = _requirements(candidate, recipes)
+                if available is not None and any(
+                    amount > inventory.get(material, 0) + available.get(material, 0)
+                    for material, amount in required.items()
+                ):
+                    continue
                 new_cost = _new_cost(required, inventory, raw_costs)
                 if new_cost > budget + 1e-9:
                     continue
                 revenue = 0.0
+                output_units = {}
                 for name, units in candidate.items():
                     output = recipes[name].output_good
-                    revenue += units * expected_unit_revenue.get(output, 0.0)
+                    output_units[output] = output_units.get(output, 0) + units
+                if any(units > max(0, target_by_good.get(good, 0) - finished_inventory.get(good, 0))
+                       for good, units in output_units.items()):
+                    continue
+                for output, units in output_units.items():
+                    revenue += (sum(marginal_values.get(output, [])[:units]) if marginal_values is not None
+                                else units * expected_unit_revenue.get(output, 0.0))
                 score = revenue - new_cost
                 next_states.append(
                     (score, candidate, required, new_cost, produced + quantity)

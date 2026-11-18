@@ -142,7 +142,7 @@ class PricingEngine:
         ladder_levels: int = 1,
         price_factor: float = 1.0,
     ) -> None:
-        if mode not in {"margin", "ucb", "gp", "demand", "hybrid"}:
+        if mode not in {"conservative", "margin", "ucb", "gp", "demand", "hybrid"}:
             raise ValueError(f"unsupported pricing mode: {mode}")
         if ladder_levels not in {1, 2, 3}:
             raise ValueError("ladder_levels must be 1, 2, or 3")
@@ -185,6 +185,23 @@ class PricingEngine:
         ]
         learner = self._learner(good)
 
+        if self.mode == "conservative":
+            last = demand.last
+            if last is None:
+                price = unit_cost * 4.8 * pressure_factor * self.price_factor
+            else:
+                price = last.price
+                if last.censored:
+                    price *= 1.06
+                elif demand.zero_streak >= 2:
+                    price *= 0.82 if demand.zero_streak < 5 else 0.70
+                elif last.sold > 0 and last.sold < last.offered * 0.4:
+                    price *= 0.95
+            # Existing stock is sunk cash: it may be rational to sell below
+            # replacement cost. The procurement planner still costs new inputs.
+            price = max(unit_cost * 0.15, min(unit_cost * 16.2, price))
+            self._last[good] = PriceChoice(3, price, unit_cost, max(0, int(stock)))
+            return price
         if self.mode == "margin":
             arm = 3
         elif self.mode == "ucb":

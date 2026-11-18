@@ -1,3 +1,5 @@
+> **Versione conservativa del team:** vedere [docs/CONSERVATIVE_AGENT.md](docs/CONSERVATIVE_AGENT.md) e [reports/CONSERVATIVE.md](reports/CONSERVATIVE.md). Le istruzioni ufficiali seguono inalterate.
+
 # Dynamic Market Exchange — essential guide
 
 Build an agent that bids for materials, assembles products, and sets sale

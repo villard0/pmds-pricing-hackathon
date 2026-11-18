@@ -75,12 +75,12 @@ class AuctionModel:
             if lot is None or shortage <= 0 or lot.quantity <= 0:
                 continue
             fair_share = max(1.0, lot.quantity / max(1, team_count))
-            scarcity = shortage / fair_share
-            base = self.expected_price(good, lot.reserve_price, scarcity)
-            cap = max(lot.reserve_price, float(value_caps.get(good, base)))
+            scarcity = 0.8
+            base = self.expected_price(good, max(0.01, lot.reserve_price), scarcity)
+            cap = float(value_caps.get(good, 0.0))
             base = min(base, cap)
             if base + 1e-9 < lot.reserve_price:
-                continue
+                return []
             shortage = min(shortage, lot.quantity)
             priority = max(1, min(shortage, ceil(shortage * 0.38)))
             if tiered and shortage >= 3:
@@ -94,6 +94,9 @@ class AuctionModel:
         # Higher priority tiers survive budget pressure first, but scale each
         # tier proportionally enough to retain complementary components.
         total = sum(quantity * price for _, quantity, price, _ in planned)
+        # Never break complementary recipes through independent rounding.
+        if total > budget + 1e-9:
+            return []
         scale = min(1.0, max(0.0, budget) / total) if total > 0 else 0.0
         bids: list[tuple[str, int, float]] = []
         remaining_budget = max(0.0, budget)
