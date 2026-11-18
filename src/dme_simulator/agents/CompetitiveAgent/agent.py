@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from math import ceil
+from math import ceil, prod
 
 from dme_simulator.agents import (
     AssemblyOrder,
@@ -22,7 +22,7 @@ from .pricing import PricingEngine
 
 
 class CompetitiveAgent(BaseAgent):
-    """Adaptive joint planner using only public observations.
+    """Adaptive production specialist using only public observations.
 
     Optional constructor arguments exist solely for reproducible ablations in
     the local benchmark.  The official entry point remains constructible with
@@ -72,6 +72,8 @@ class CompetitiveAgent(BaseAgent):
         self._recent_offered: deque[int] = deque(maxlen=8)
         self._recent_capital_change: deque[float] = deque(maxlen=8)
         self._investment_share = 0.25
+        self._specialist_good: str | None = None
+        self._specialist_since_turn = 0
 
     # ------------------------------------------------------------------
     # Observation and feedback
@@ -319,17 +321,20 @@ class CompetitiveAgent(BaseAgent):
             )
 
         recipe_costs: dict[str, float] = {}
-        for recipe in goods_config.recipes.values():
+        recipe_by_good: dict[str, str] = {}
+        for recipe_name, recipe in goods_config.recipes.items():
             cost = self._recipe_cost(recipe, raw_costs)
             previous = recipe_costs.get(recipe.output_good)
             if previous is None or cost < previous:
                 recipe_costs[recipe.output_good] = cost
+                recipe_by_good[recipe.output_good] = recipe_name
 
         # Supply is not demand. Probe one unit; expand only after real sales.
         prior_per_good = 0.35
 
         prices: dict[str, float] = {}
         targets: dict[str, int] = {}
+        expected_demand: dict[str, float] = {}
         expected_unit_revenue: dict[str, float] = {}
         limits: dict[str, int] = {}
         for good in goods_config.finished_goods:
@@ -367,15 +372,117 @@ class CompetitiveAgent(BaseAgent):
                 recovery_weight = min(0.50, stale / 24.0)
                 expected = (1.0 - recovery_weight) * expected + recovery_weight * prior_per_good
             targets[good] = target
+            expected_demand[good] = expected
             sale_probability = min(1.0, expected / max(1, target))
             expected_unit_revenue[good] = price * sale_probability
 
-        total_target = max(4, min(96, sum(targets.values())))
+        # Adaptive Specialist: compare one realistic three-unit production run
+        # per product.  Completion risk, stale finished stock and recipe cost
+        # matter alongside expected margin.  The incumbent changes only when a
+        # challenger is clearly better, preventing turn-by-turn oscillation.
+        specialist_scores: dict[str, float] = {}
+        for good in goods_config.finished_goods:
+            recipe_name = recipe_by_good.get(good)
+            if recipe_name is None:
+                continue
+            recipe = goods_config.recipes[recipe_name]
+            quantity = min(3, limits[good])
+            fill_rates = []
+            owned_units = 0
+            required_units = 0
+            for material, units in recipe.inputs.items():
+                required = units * quantity
+                owned = min(required, int(state.inventory.get(material, 0)))
+                required_units += required
+                owned_units += owned
+                shortage = max(0, required - owned)
+                lot = lot_by_good.get(material)
+                fill_rates.append(
+                    self.auctions.fill_probability(
+                        material,
+                        shortage,
+                        lot.quantity if lot is not None else 0,
+                        team_count,
+                    )
+                )
+            completion = prod(fill_rates) if fill_rates else 1.0
+            coverage = owned_units / max(1, required_units)
+            unit_cost = recipe_costs.get(good, 0.0)
+            margin = expected_unit_revenue.get(good, 0.0) - unit_cost
+            model = self.demand.model(good)
+            stale_stock = int(state.inventory.get(good, 0))
+            inventory_risk = stale_stock * unit_cost * (
+                0.20 + 0.55 * (1.0 - model.recent_sell_through)
+            )
+            completion_risk = (1.0 - completion) * unit_cost * quantity * 0.35
+            specialist_scores[good] = (
+                margin * quantity * (0.65 + 0.35 * completion)
+                + coverage * unit_cost
+                - inventory_risk
+                - completion_risk
+            )
+
+        if specialist_scores:
+            challenger = max(specialist_scores, key=specialist_scores.get)
+            if self._specialist_good not in specialist_scores:
+                self._specialist_good = challenger
+                self._specialist_since_turn = state.turn
+            elif challenger != self._specialist_good:
+                incumbent_score = specialist_scores[self._specialist_good]
+                challenger_score = specialist_scores[challenger]
+                held_turns = state.turn - self._specialist_since_turn
+                switch_margin = max(1.0, abs(incumbent_score) * 0.30)
+                clearly_better = challenger_score - incumbent_score > switch_margin
+                if held_turns >= 4 and clearly_better:
+                    self._specialist_good = challenger
+                    self._specialist_since_turn = state.turn
+
+        specialist = self._specialist_good
+        if specialist is not None:
+            model = self.demand.model(specialist)
+            current = int(state.inventory.get(specialist, 0))
+            limit = limits[specialist]
+            target = targets[specialist]
+            if model.observations == 0:
+                target = min(limit, 3)
+            elif model.zero_streak:
+                # A miss immediately stops expansion. Existing stock is sold
+                # down; an empty line receives at most the scheduled probe.
+                target = current if current > 0 else min(target, 1)
+            elif model.recent_sales > 0:
+                if model.recent_sales >= 5:
+                    target = ceil(model.recent_sales * 1.65) + 1
+                elif model.recent_sales >= 3:
+                    target = 8
+                elif model.recent_sales >= 1:
+                    target = 5
+                target = max(target, current)
+            target = max(0, min(limit, target))
+            targets = {
+                good: int(state.inventory.get(good, 0))
+                for good in goods_config.finished_goods
+            }
+            targets[specialist] = target
+
+        primary_units = max(
+            0,
+            targets.get(specialist, 0) - int(state.inventory.get(specialist, 0)),
+        ) if specialist is not None else 0
+        total_target = max(1, min(64, primary_units))
         planning_budget = self._investment_budget(state, goods_config)
         availability = {lot.good: lot.quantity for lot in state.auction_lots}
         desired_materials = {good: 0 for good in goods_config.raw_materials}
-        for recipe in goods_config.recipes.values():
-            quantity = targets.get(recipe.output_good, 0)
+        specialist_recipes = {
+            name: recipe
+            for name, recipe in goods_config.recipes.items()
+            if recipe.output_good == specialist
+        }
+        for recipe in specialist_recipes.values():
+            quantity = max(
+                0,
+                targets.get(recipe.output_good, 0)
+                - int(state.inventory.get(recipe.output_good, 0)),
+            )
             for material, amount in recipe.inputs.items():
                 desired_materials[material] += amount * quantity
         fill_probabilities = {
@@ -397,7 +504,7 @@ class CompetitiveAgent(BaseAgent):
             ]
         if self.use_joint_planning:
             plan = joint_plan(
-                goods_config.recipes,
+                specialist_recipes,
                 state.inventory,
                 raw_costs,
                 state.inventory,
@@ -407,12 +514,11 @@ class CompetitiveAgent(BaseAgent):
                 total_target,
                 available=availability,
                 marginal_values=marginal_values,
-                fill_probabilities=fill_probabilities,
-                max_active_goods=3,
+                max_active_goods=1,
             )
         else:
             plan = greedy_plan(
-                goods_config.recipes,
+                specialist_recipes,
                 state.inventory,
                 raw_costs,
                 state.inventory,
@@ -421,6 +527,48 @@ class CompetitiveAgent(BaseAgent):
                 planning_budget,
                 total_target,
             )
+
+        # Secondary production may consume only raw materials that were already
+        # owned and are not reserved for the specialist plan.  It never creates
+        # extra auction requirements, so new cash remains concentrated on the
+        # primary product while stranded stock can still be monetized.
+        combined_quantities = dict(plan.quantities)
+        residual_inventory = dict(state.inventory)
+        for material in goods_config.raw_materials:
+            reserved = min(
+                int(state.inventory.get(material, 0)),
+                int(plan.requirements.get(material, 0)),
+            )
+            residual_inventory[material] = max(
+                0, int(state.inventory.get(material, 0)) - reserved
+            )
+        secondary_recipes = {
+            name: recipe
+            for name, recipe in goods_config.recipes.items()
+            if recipe.output_good != specialist
+        }
+        if secondary_recipes:
+            secondary_targets = {
+                good: int(state.inventory.get(good, 0)) + 2
+                for good in goods_config.finished_goods
+                if good != specialist
+            }
+            secondary = joint_plan(
+                secondary_recipes,
+                residual_inventory,
+                raw_costs,
+                state.inventory,
+                secondary_targets,
+                expected_unit_revenue,
+                0.0,
+                4,
+                available={material: 0 for material in goods_config.raw_materials},
+                marginal_values=marginal_values,
+                max_active_goods=2,
+            )
+            for recipe_name, quantity in secondary.quantities.items():
+                if quantity > 0:
+                    combined_quantities[recipe_name] = quantity
 
         value_caps = self._material_value_caps(
             plan, goods_config, raw_costs, expected_unit_revenue
@@ -446,8 +594,12 @@ class CompetitiveAgent(BaseAgent):
         assembly = [
             AssemblyOrder(recipe_name, quantity)
             for recipe_name, quantity in sorted(
-                plan.quantities.items(),
-                key=lambda item: (-margins.get(item[0], 0.0), item[0]),
+                combined_quantities.items(),
+                key=lambda item: (
+                    goods_config.recipes[item[0]].output_good != specialist,
+                    -margins.get(item[0], 0.0),
+                    item[0],
+                ),
             )
             if quantity > 0
         ]
@@ -456,7 +608,7 @@ class CompetitiveAgent(BaseAgent):
             good: int(state.inventory.get(good, 0))
             for good in goods_config.finished_goods
         }
-        for recipe_name, quantity in plan.quantities.items():
+        for recipe_name, quantity in combined_quantities.items():
             output = goods_config.recipes[recipe_name].output_good
             planned_finished[output] = planned_finished.get(output, 0) + quantity
 
