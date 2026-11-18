@@ -5,7 +5,7 @@ This repository now has one purpose per top-level directory:
 - `src/dme_simulator/`: official simulator and the current `CompetitiveAgent`.
 - `config/`: official example scenarios. These are kept unchanged.
 - `simulation_lab/`: reproducible comparison environment for the two growth agents.
-- `submission/`: the two ZIP files that must be preserved.
+- `submission/`: only the canonical `CompetitiveAgent.zip` upload bundle.
 - `tests/`: fast correctness and timing checks.
 - `docs/agent_interface.md`: official agent API reference.
 
@@ -22,3 +22,7 @@ uv run python simulation_lab/run_suite.py --suite smoke
 ```
 
 See `simulation_lab/README.md` for the full scenario and roster catalog.
+
+`CompetitiveAgent.zip` is generated directly from the five Python files in
+`src/dme_simulator/agents/CompetitiveAgent/`; no separate submission source is
+maintained.
