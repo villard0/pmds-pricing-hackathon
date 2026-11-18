@@ -11,6 +11,8 @@ class MaterialState:
     multiplier: float = 1.35
     loss_streak: int = 0
     paid_ema: float = 0.0
+    fill_ema: float = 0.50
+    observations: int = 0
 
 
 class AuctionModel:
@@ -31,6 +33,8 @@ class AuctionModel:
             return
         state = self._state(good)
         fill = won / requested
+        state.fill_ema = fill if state.observations == 0 else 0.72 * state.fill_ema + 0.28 * fill
+        state.observations += 1
         if fill < 0.30:
             state.loss_streak = min(5, state.loss_streak + 1)
             state.multiplier = min(2.35, state.multiplier + 0.10)
@@ -50,6 +54,18 @@ class AuctionModel:
         if state.paid_ema > 0:
             price = max(price, state.paid_ema * (1.0 + 0.025 * state.loss_streak))
         return price
+
+    def fill_probability(
+        self, good: str, shortage: int, lot_quantity: int, team_count: int
+    ) -> float:
+        if shortage <= 0:
+            return 1.0
+        fair_share = max(0.1, lot_quantity / max(1, team_count))
+        market_prior = max(0.15, min(0.85, fair_share / shortage))
+        state = self._state(good)
+        if state.observations == 0:
+            return market_prior
+        return max(0.05, min(0.95, 0.72 * state.fill_ema + 0.28 * market_prior))
 
     def build_tiers(
         self,
@@ -75,7 +91,7 @@ class AuctionModel:
             if lot is None or shortage <= 0 or lot.quantity <= 0:
                 continue
             fair_share = max(1.0, lot.quantity / max(1, team_count))
-            scarcity = 0.8
+            scarcity = max(0.0, min(2.0, shortage / fair_share))
             base = self.expected_price(good, max(0.01, lot.reserve_price), scarcity)
             cap = float(value_caps.get(good, 0.0))
             base = min(base, cap)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import prod
 
 
 @dataclass(slots=True)
@@ -45,6 +46,8 @@ def joint_plan(
     beam_width: int = 96,
     available: dict[str, int] | None = None,
     marginal_values: dict[str, list[float]] | None = None,
+    fill_probabilities: dict[str, float] | None = None,
+    max_active_goods: int | None = None,
 ) -> Plan:
     """Choose a whole recipe portfolio, not independent material purchases.
 
@@ -97,10 +100,34 @@ def joint_plan(
                 if any(units > max(0, target_by_good.get(good, 0) - finished_inventory.get(good, 0))
                        for good, units in output_units.items()):
                     continue
+                if max_active_goods is not None and sum(units > 0 for units in output_units.values()) > max_active_goods:
+                    continue
                 for output, units in output_units.items():
                     revenue += (sum(marginal_values.get(output, [])[:units]) if marginal_values is not None
                                 else units * expected_unit_revenue.get(output, 0.0))
-                score = revenue - new_cost
+                if fill_probabilities is None:
+                    score = revenue - new_cost
+                else:
+                    missing = {
+                        material: max(0, amount - inventory.get(material, 0))
+                        for material, amount in required.items()
+                    }
+                    relevant = [
+                        fill_probabilities.get(material, 0.5)
+                        for material, amount in missing.items()
+                        if amount > 0
+                    ]
+                    # A recipe is usable only when every missing complement is
+                    # acquired.  Treat the learned fill rates as a lightweight
+                    # independent approximation of that joint event.
+                    completion = prod(relevant) if relevant else 1.0
+                    expected_cost = sum(
+                        amount * raw_costs.get(material, 0.0)
+                        * fill_probabilities.get(material, 0.5)
+                        for material, amount in missing.items()
+                    )
+                    stranded = max(0.0, expected_cost - completion * new_cost)
+                    score = completion * revenue - expected_cost - 0.35 * stranded
                 next_states.append(
                     (score, candidate, required, new_cost, produced + quantity)
                 )

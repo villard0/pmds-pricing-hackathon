@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from math import ceil
 
 from dme_simulator.agents import (
@@ -36,10 +37,10 @@ class CompetitiveAgent(BaseAgent):
         price_factor: float = 1.0,
         use_joint_planning: bool = True,
         use_demand_learning: bool = True,
-        tiered_bids: bool = False,
+        tiered_bids: bool = True,
         adaptive_budget: bool = True,
     ) -> None:
-        if pricing_mode not in {"conservative", "adaptive", "margin", "ucb", "gp", "demand", "hybrid"}:
+        if pricing_mode not in {"robust", "conservative", "adaptive", "margin", "ucb", "gp", "demand", "hybrid"}:
             raise ValueError(f"unsupported pricing mode: {pricing_mode}")
         if ladder_levels not in {0, 1, 2, 3}:
             raise ValueError("ladder_levels must be 0, 1, 2, or 3")
@@ -61,6 +62,16 @@ class CompetitiveAgent(BaseAgent):
         self._sales_count = 0
         self._last_listings: dict[str, tuple[int, float]] = {}
         self._capital_anchor: float | None = None
+        self._capital_peak: float = 0.0
+        self._last_capital: float | None = None
+        self._last_feedback_turn = 0
+        self._last_market_test: dict[str, int] = {}
+        self._recent_spend: deque[float] = deque(maxlen=8)
+        self._recent_revenue: deque[float] = deque(maxlen=8)
+        self._recent_sold: deque[int] = deque(maxlen=8)
+        self._recent_offered: deque[int] = deque(maxlen=8)
+        self._recent_capital_change: deque[float] = deque(maxlen=8)
+        self._investment_share = 0.25
 
     # ------------------------------------------------------------------
     # Observation and feedback
@@ -102,12 +113,16 @@ class CompetitiveAgent(BaseAgent):
         return [item for item in transactions if item.seller == self._team_id]
 
     def _consume_feedback(self, state: Observation) -> None:
+        if state.turn <= self._last_feedback_turn:
+            return
         self._resolve_team_id(state)
         auction_transactions = self._own_auction_transactions(state)
+        turn_spend = 0.0
         if auction_transactions is not None:
             won: dict[str, int] = {}
             paid: dict[str, float] = {}
             for transaction in auction_transactions:
+                turn_spend += transaction.price * transaction.quantity
                 won[transaction.good] = won.get(transaction.good, 0) + transaction.quantity
                 paid[transaction.good] = paid.get(transaction.good, 0.0) + (
                     transaction.price * transaction.quantity
@@ -118,10 +133,15 @@ class CompetitiveAgent(BaseAgent):
                 self.auctions.observe(good, quantity, average)
 
         sales_transactions = self._own_sales_transactions(state)
+        turn_revenue = 0.0
+        turn_sold = 0
+        turn_offered = 0
         if sales_transactions is not None and self._last_listings:
             sold: dict[str, int] = {}
             revenue: dict[str, float] = {}
             for transaction in sales_transactions:
+                turn_revenue += transaction.price * transaction.quantity
+                turn_sold += transaction.quantity
                 sold[transaction.good] = sold.get(transaction.good, 0) + transaction.quantity
                 revenue[transaction.good] = revenue.get(transaction.good, 0.0) + (
                     transaction.price * transaction.quantity
@@ -140,6 +160,8 @@ class CompetitiveAgent(BaseAgent):
                 units = min(offered, units)
                 if offered <= 0:
                     continue
+                turn_offered += offered
+                self._last_market_test[good] = state.turn - 1
                 observed_price = listed_price
                 censored = offered > 0 and units >= offered
                 if self.use_demand_learning:
@@ -149,6 +171,15 @@ class CompetitiveAgent(BaseAgent):
                 self.pricing.feedback(
                     good, offered=offered, sold=units, revenue=proceeds
                 )
+        if state.turn > 1:
+            self._recent_spend.append(turn_spend)
+            self._recent_revenue.append(turn_revenue)
+            self._recent_sold.append(turn_sold)
+            self._recent_offered.append(turn_offered)
+            if self._last_capital is not None:
+                self._recent_capital_change.append(state.capital - self._last_capital)
+        self._capital_peak = max(self._capital_peak, state.capital)
+        self._last_feedback_turn = state.turn
 
     # ------------------------------------------------------------------
     # Market estimates
@@ -166,19 +197,60 @@ class CompetitiveAgent(BaseAgent):
         sizes = [sum(recipe.inputs.values()) for recipe in goods_config.recipes.values()]
         return sum(sizes) / max(1, len(sizes))
 
-    def _budget_share(self, state: Observation, team_count: int) -> float:
+    def _investment_budget(
+        self, state: Observation, goods_config: GoodsConfig
+    ) -> float:
+        """Smoothly scale exposure using realized operating evidence."""
         if not self.adaptive_budget:
-            return 0.45
-        crowding = max(0, team_count - 4)
-        share = 0.50 - min(0.16, crowding * 0.008)
-        if self._capital_anchor is not None and state.capital < 0.55 * self._capital_anchor:
-            share -= 0.08
-        raw_stock = sum(
-            state.inventory.get(lot.good, 0) for lot in state.auction_lots
+            return state.capital * 0.30
+        spend = sum(self._recent_spend)
+        revenue = sum(self._recent_revenue)
+        profit = revenue - spend
+        roi = profit / spend if spend > 1e-9 else 0.0
+        offered = sum(self._recent_offered)
+        sell_through = sum(self._recent_sold) / offered if offered else 0.0
+        peak = max(self._capital_peak, state.capital, 1.0)
+        drawdown = max(0.0, (peak - state.capital) / peak)
+        recent_trend = sum(self._recent_capital_change) / max(
+            1.0, self._capital_anchor or state.capital
         )
-        if raw_stock > 2 * max(1, len(state.auction_lots)):
-            share -= 0.06
-        return max(0.08, min(0.20, share))
+
+        finished = sum(
+            state.inventory.get(good, 0) for good in goods_config.finished_goods
+        )
+        raw = sum(
+            state.inventory.get(good, 0) for good in goods_config.raw_materials
+        )
+        sales_rate = sum(self._recent_sold) / max(1, len(self._recent_sold))
+        inventory_pressure = (finished + raw / max(1.0, self._average_recipe_size(goods_config))) / max(
+            1.0, sales_rate * 3.0
+        )
+
+        target = 0.25
+        if spend > 0:
+            target += max(-0.12, min(0.14, roi * 0.16))
+        if sell_through >= 0.65 and roi > 0:
+            target += 0.08
+        elif offered > 0 and sell_through < 0.20:
+            target -= 0.09
+        if recent_trend > 0.05:
+            target += 0.05
+        elif recent_trend < -0.04:
+            target -= 0.07
+        if inventory_pressure > 1.5:
+            target -= min(0.12, 0.045 * inventory_pressure)
+        if drawdown > 0.08:
+            target -= min(0.15, drawdown * 0.55)
+        if roi > 0.55 and sell_through > 0.70 and drawdown < 0.04:
+            target = max(target, 0.46)
+        target = max(0.10, min(0.52, target))
+        self._investment_share = 0.72 * self._investment_share + 0.28 * target
+
+        # Protect part of the current operation and accumulated peak, but never
+        # freeze all profits. Drawdown raises the liquidity reserve smoothly.
+        reserve_ratio = min(0.72, 0.48 + drawdown * 0.9 + max(0.0, inventory_pressure - 1.0) * 0.04)
+        risk_capacity = state.capital * (1.0 - reserve_ratio)
+        return max(0.0, min(state.capital * self._investment_share, risk_capacity))
 
     def _competition(self, state: Observation, good: str, prior: float) -> float:
         if len(state.public_inventories) <= 1:
@@ -221,6 +293,7 @@ class CompetitiveAgent(BaseAgent):
     def decide(self, state: Observation, goods_config: GoodsConfig) -> Decision:
         if self._capital_anchor is None:
             self._capital_anchor = max(1.0, state.capital)
+            self._capital_peak = state.capital
         self._consume_feedback(state)
 
         team_count = max(1, len(state.public_capital))
@@ -252,19 +325,19 @@ class CompetitiveAgent(BaseAgent):
             if previous is None or cost < previous:
                 recipe_costs[recipe.output_good] = cost
 
-        average_inputs = self._average_recipe_size(goods_config)
-        total_target = 24
-        good_count = max(1, len(goods_config.finished_goods))
         # Supply is not demand. Probe one unit; expand only after real sales.
         prior_per_good = 0.35
-        per_good_limit = 12
 
         prices: dict[str, float] = {}
         targets: dict[str, int] = {}
         expected_unit_revenue: dict[str, float] = {}
+        limits: dict[str, int] = {}
         for good in goods_config.finished_goods:
             current = state.inventory.get(good, 0)
             model = self.demand.model(good)
+            observed_scale = max(prior_per_good, model.recent_sales)
+            per_good_limit = max(4, min(64, ceil(observed_scale * 1.8) + 2))
+            limits[good] = per_good_limit
             competition = self._competition(state, good, prior_per_good)
             quote_stock = max(1, current)
             price = self.pricing.quote(
@@ -284,23 +357,43 @@ class CompetitiveAgent(BaseAgent):
                 target = max(1, min(per_good_limit, ceil(prior_per_good)))
                 expected = prior_per_good
             target = max(0, min(per_good_limit, target))
+            if (
+                target == 0
+                and current == 0
+                and model.should_reprobe(state.turn, sum(map(ord, good)))
+            ):
+                target = 1
+                stale = state.turn - self._last_market_test.get(good, 0)
+                recovery_weight = min(0.50, stale / 24.0)
+                expected = (1.0 - recovery_weight) * expected + recovery_weight * prior_per_good
             targets[good] = target
             sale_probability = min(1.0, expected / max(1, target))
             expected_unit_revenue[good] = price * sale_probability
 
-        budget_share = self._budget_share(state, team_count)
-        # Hard cash reserve: even a complete failure to sell cannot spend more
-        # than 3% of starting cash (assuming the official no-other-cost rules).
-        planning_budget = max(0.0, min(state.capital * budget_share,
-                                      state.capital - 0.97 * self._capital_anchor))
+        total_target = max(4, min(96, sum(targets.values())))
+        planning_budget = self._investment_budget(state, goods_config)
         availability = {lot.good: lot.quantity for lot in state.auction_lots}
+        desired_materials = {good: 0 for good in goods_config.raw_materials}
+        for recipe in goods_config.recipes.values():
+            quantity = targets.get(recipe.output_good, 0)
+            for material, amount in recipe.inputs.items():
+                desired_materials[material] += amount * quantity
+        fill_probabilities = {
+            lot.good: self.auctions.fill_probability(
+                lot.good,
+                max(1, desired_materials.get(lot.good, 0) - state.inventory.get(lot.good, 0)),
+                lot.quantity,
+                team_count,
+            )
+            for lot in state.auction_lots
+        }
         marginal_values = {}
         for good in goods_config.finished_goods:
             model = self.demand.model(good)
             stock = int(state.inventory.get(good, 0))
             marginal_values[good] = [
                 prices[good] * model.sale_probability(stock + k, prices[good], prior_per_good)
-                for k in range(1, per_good_limit + 1)
+                for k in range(1, limits[good] + 1)
             ]
         if self.use_joint_planning:
             plan = joint_plan(
@@ -314,6 +407,8 @@ class CompetitiveAgent(BaseAgent):
                 total_target,
                 available=availability,
                 marginal_values=marginal_values,
+                fill_probabilities=fill_probabilities,
+                max_active_goods=3,
             )
         else:
             plan = greedy_plan(
@@ -383,4 +478,5 @@ class CompetitiveAgent(BaseAgent):
             if offered:
                 listing_memory[good] = (offered, value / offered)
         self._last_listings = listing_memory
+        self._last_capital = state.capital
         return Decision(bids=bids, assembly=assembly, listings=listings)

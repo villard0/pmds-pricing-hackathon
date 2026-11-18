@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from math import exp, log, ceil
+from math import ceil, exp, log
 
 
 @dataclass(slots=True)
@@ -85,7 +85,42 @@ class DemandEstimator:
                     estimate,
                     anchor_demand * (price / anchor.price) ** -1.65,
                 )
+        zeros = [item for item in self._history if item.sold == 0 and not item.censored]
+        if zeros:
+            # A miss is noisy (customers may simply not have arrived), but
+            # repeated misses at a lower price must make still higher prices
+            # progressively less plausible.  This is a soft power-law cap,
+            # never the old hard 0.08 boundary.
+            reference = zeros[-1].price
+            if price > reference * 1.001:
+                # Repeated misses are already reflected by the local kernel.
+                # Keep the extrapolation cap deliberately weak so a sparse
+                # market does not turn one unlucky turn into zero demand.
+                soft_level = prior * 0.90
+                estimate = min(
+                    estimate,
+                    soft_level * (price / reference) ** -1.05,
+                )
         return estimate
+
+    def demand_curve(self, prices: list[float], prior: float) -> list[float]:
+        """Return a demand curve that is non-increasing in price.
+
+        Kernel estimates are useful locally but can cross when observations are
+        sparse.  Pricing always evaluates a finite candidate grid, so a simple
+        monotone projection is both cheaper and safer than extrapolating a
+        global parametric law.  Zero-sales samples remain noisy observations:
+        they reduce the local estimate but never create a hard boundary.
+        """
+        if not prices:
+            return []
+        order = sorted(range(len(prices)), key=prices.__getitem__)
+        projected = [0.0] * len(prices)
+        ceiling = float("inf")
+        for index in order:
+            ceiling = min(ceiling, self.expected_demand(prices[index], prior))
+            projected[index] = max(0.0, ceiling)
+        return projected
 
     def sale_probability(self, unit: int, price: float, prior: float) -> float:
         """P(D >= unit), using a bounded Poisson approximation, not a floor."""
@@ -99,9 +134,30 @@ class DemandEstimator:
             cumulative += mass
         return max(0.0, min(1.0, 1.0 - cumulative))
 
+    @staticmethod
+    def expected_sales_from_mean(stock: int, mean: float) -> float:
+        """E[min(D, stock)] for a Poisson approximation with bounded work."""
+        stock = max(0, int(stock))
+        mean = max(0.0, min(100.0, float(mean)))
+        if stock == 0:
+            return 0.0
+        mass = exp(-mean)
+        cumulative = mass
+        expected = max(0.0, 1.0 - cumulative)
+        for unit in range(2, stock + 1):
+            mass *= mean / (unit - 1)
+            cumulative += mass
+            expected += max(0.0, 1.0 - cumulative)
+        return min(float(stock), expected)
+
     @property
     def last(self):
         return self._history[-1] if self._history else None
+
+    @property
+    def highest_successful_price(self) -> float | None:
+        prices = [item.price for item in self._history if item.sold > 0]
+        return max(prices) if prices else None
 
     @property
     def zero_streak(self) -> int:
@@ -112,20 +168,46 @@ class DemandEstimator:
             count += 1
         return count
 
+    @property
+    def recent_sales(self) -> float:
+        observations = list(self._history)[-6:]
+        if not observations:
+            return 0.0
+        weights = list(range(1, len(observations) + 1))
+        return sum(item.sold * weight for item, weight in zip(observations, weights)) / sum(weights)
+
+    @property
+    def recent_sell_through(self) -> float:
+        observations = list(self._history)[-6:]
+        offered = sum(item.offered for item in observations)
+        return sum(item.sold for item in observations) / offered if offered else 0.0
+
+    def should_reprobe(self, turn: int, phase: int = 0) -> bool:
+        """Occasionally reopen a product after a run of unsuccessful offers."""
+        if self.zero_streak < 3:
+            return False
+        interval = min(16, 5 + self.zero_streak)
+        return (int(turn) + int(phase)) % interval == 0
+
     def expected_revenue(self, price: float, stock: int, prior: float) -> float:
         if stock <= 0:
             return 0.0
-        return float(price) * sum(self.sale_probability(k, price, prior) for k in range(1, stock + 1))
+        return float(price) * self.expected_sales_from_mean(
+            stock, self.expected_demand(price, prior)
+        )
 
     def target_stock(self, price: float, prior: float, maximum: int) -> int:
         estimate = self.expected_demand(price, prior)
-        # A small buffer is useful when the last sample sold out, but bounded
-        # targets prevent an optimistic cold-start model from accumulating stock.
         if not self._history:
             return min(1, maximum)
-        if self.zero_streak >= 3 or estimate < 0.15:
+        if self.zero_streak >= 3:
             return 0
-        return max(0, min(int(maximum), ceil(estimate * 1.4)))
+        if estimate < 0.08 and self.recent_sales == 0:
+            return 0
+        target = max(estimate * 1.35, self.recent_sales * 1.25)
+        if self.last is not None and self.last.censored:
+            target = max(target, self.last.sold + 1.0)
+        return max(0, min(int(maximum), ceil(target)))
 
 
 class DemandBook:

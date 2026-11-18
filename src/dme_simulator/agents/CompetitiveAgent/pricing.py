@@ -11,7 +11,7 @@ from .demand import DemandEstimator
 
 # Multipliers are relative to the currently estimated replacement cost.  This
 # makes the price grid portable across private scenarios with different scales.
-MARKUPS = (1.50, 2.20, 3.20, 4.80, 7.20, 10.80, 16.20, 24.30, 36.50)
+MARKUPS = (0.60, 0.80, 1.05, 1.40, 1.90, 2.60, 3.50, 4.80, 6.50, 8.80, 12.00, 16.20)
 
 
 @dataclass(slots=True)
@@ -142,7 +142,7 @@ class PricingEngine:
         ladder_levels: int = 1,
         price_factor: float = 1.0,
     ) -> None:
-        if mode not in {"conservative", "margin", "ucb", "gp", "demand", "hybrid"}:
+        if mode not in {"robust", "conservative", "margin", "ucb", "gp", "demand", "hybrid"}:
             raise ValueError(f"unsupported pricing mode: {mode}")
         if ladder_levels not in {1, 2, 3}:
             raise ValueError("ladder_levels must be 1, 2, or 3")
@@ -185,6 +185,48 @@ class PricingEngine:
         ]
         learner = self._learner(good)
 
+        if self.mode == "robust":
+            if demand.observations == 0:
+                # One economically meaningful probe, not a sweep of extreme
+                # prices.  The prior sale probability still makes procurement
+                # selective at this markup.
+                arm = 7
+                price = candidates[arm]
+            else:
+                # Include local moves around the last tested price so learning
+                # is not limited by the replacement-cost grid.
+                last_price = demand.last.price if demand.last is not None else unit_cost * 3.5
+                dynamic = [last_price * factor for factor in (0.78, 0.90, 1.0, 1.08, 1.20)]
+                floor = unit_cost * (0.55 if stock > 0 else 1.05)
+                ceiling = unit_cost * MARKUPS[-1]
+                prices = sorted(
+                    {
+                        max(floor, min(ceiling, value))
+                        for value in candidates + dynamic
+                    }
+                )
+                means = demand.demand_curve(prices, prior_demand)
+                values = [
+                    price * demand.expected_sales_from_mean(max(1, stock), mean)
+                    for price, mean in zip(prices, means)
+                ]
+                # Unsold inventory is sunk cash.  A mild markdown preference
+                # breaks near-ties after repeated zero-sales without imposing a
+                # rigid historical-cost floor.
+                markdown = min(0.18, 0.04 * demand.zero_streak)
+                if stock > 0 and markdown:
+                    values = [
+                        value * (1.0 + markdown * (1.0 - price / ceiling))
+                        for value, price in zip(values, prices)
+                    ]
+                selected = max(range(len(prices)), key=lambda index: (values[index], -prices[index]))
+                price = prices[selected]
+                arm = min(
+                    range(len(MARKUPS)),
+                    key=lambda index: abs(unit_cost * MARKUPS[index] - price),
+                )
+            self._last[good] = PriceChoice(arm, price, unit_cost, max(0, int(stock)))
+            return price
         if self.mode == "conservative":
             last = demand.last
             if last is None:
@@ -199,7 +241,13 @@ class PricingEngine:
                     price *= 0.95
             # Existing stock is sunk cash: it may be rational to sell below
             # replacement cost. The procurement planner still costs new inputs.
-            price = max(unit_cost * 0.15, min(unit_cost * 16.2, price))
+            supported = demand.highest_successful_price
+            ceiling = unit_cost * 12.0
+            if supported is not None:
+                # Prices above 12x are available only after an actual sale
+                # supports that scale; the legacy blind 36.5x arm is gone.
+                ceiling = min(unit_cost * MARKUPS[-1], max(ceiling, supported * 1.08))
+            price = max(unit_cost * 0.15, min(ceiling, price))
             self._last[good] = PriceChoice(3, price, unit_cost, max(0, int(stock)))
             return price
         if self.mode == "margin":

@@ -1,4 +1,3 @@
-# Preserve audited Python bytes used in benchmark fingerprints.
+# Preserve audited agent bytes used in simulation fingerprints.
 /src/dme_simulator/agents/CompetitiveAgent/*.py -text
-/benchmarks/reference_bundle/*.py -text
-/benchmarks/conservative_benchmark.py -text
+/simulation_lab/agents/ImportedCompetitiveGrowth/*.py -text

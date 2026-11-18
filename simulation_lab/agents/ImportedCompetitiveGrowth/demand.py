@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from math import exp, log
+from math import exp, log, ceil
 
 
 @dataclass(slots=True)
@@ -43,24 +43,24 @@ class DemandEstimator:
 
     def expected_demand(self, price: float, prior: float) -> float:
         """Estimate demand at ``price`` using nearby historical prices."""
-        prior = max(0.25, float(prior))
+        prior = max(0.0, float(prior))
         if not self._history or price <= 0:
             return prior
 
-        numerator = 1.75 * prior
-        denominator = 1.75
+        numerator = 0.75 * prior
+        denominator = 0.75
         total = len(self._history)
         for index, observation in enumerate(self._history):
             # Similar prices carry more information. Recent observations retain
             # more weight so the estimate follows non-stationary competition.
             distance = abs(log(max(price, 1e-9) / observation.price))
             proximity = exp(-distance / 0.48)
-            recency = 0.55 + 0.45 * (index + 1) / total
+            recency = 0.88 ** (total - index - 1)
             weight = proximity * recency
             if observation.censored:
                 inferred = max(
-                    observation.sold + 0.75,
-                    observation.sold * 1.20,
+                    observation.sold + 0.25,
+                    observation.sold * 1.15,
                 )
             else:
                 inferred = float(observation.sold)
@@ -85,32 +85,74 @@ class DemandEstimator:
                     estimate,
                     anchor_demand * (price / anchor.price) ** -1.65,
                 )
-            elif price < anchor.price:
-                estimate = max(estimate, min(anchor_demand, prior * 2.5))
-        zero_prices = [
-            item.price
-            for item in self._history
-            if item.sold == 0 and not item.censored
-        ]
-        if zero_prices:
-            zero_boundary = min(zero_prices)
-            if price >= zero_boundary:
-                estimate = min(estimate, 0.08)
-            elif not successful:
-                estimate *= max(0.15, 1.0 - 0.8 * price / zero_boundary)
         return estimate
+
+    def sale_probability(self, unit: int, price: float, prior: float) -> float:
+        """P(D >= unit), using a bounded Poisson approximation, not a floor."""
+        mean = min(100.0, self.expected_demand(price, prior))
+        if unit <= 0:
+            return 1.0
+        mass = exp(-mean)
+        cumulative = mass
+        for k in range(1, unit):
+            mass *= mean / k
+            cumulative += mass
+        return max(0.0, min(1.0, 1.0 - cumulative))
+
+    @property
+    def last(self):
+        return self._history[-1] if self._history else None
+
+    @property
+    def zero_streak(self) -> int:
+        count = 0
+        for item in reversed(self._history):
+            if item.sold:
+                break
+            count += 1
+        return count
 
     def expected_revenue(self, price: float, stock: int, prior: float) -> float:
         if stock <= 0:
             return 0.0
-        return float(price) * min(float(stock), self.expected_demand(price, prior))
+        return float(price) * sum(self.sale_probability(k, price, prior) for k in range(1, stock + 1))
 
-    def target_stock(self, price: float, prior: float, maximum: int) -> int:
+    def target_stock(
+        self,
+        price: float,
+        prior: float,
+        maximum: int,
+        *,
+        turn: int = 1,
+        current_stock: int = 0,
+        probe_phase: int = 0,
+    ) -> int:
+        """Desired finished stock with a reversible cooldown after weak sales.
+
+        A permanently zero target is an absorbing state: without inventory the
+        agent never observes demand again.  Retain occasional one-unit probes
+        when an old product has stopped selling, but never add to stale stock.
+        """
+        maximum = max(0, int(maximum))
+        current_stock = max(0, int(current_stock))
+        if maximum == 0:
+            return 0
         estimate = self.expected_demand(price, prior)
-        # A small buffer is useful when the last sample sold out, but bounded
-        # targets prevent an optimistic cold-start model from accumulating stock.
-        buffer = 1.25 if self._history and self._history[-1].censored else 0.5
-        return max(1, min(int(maximum), int(estimate + buffer + 0.999)))
+        if not self._history:
+            return min(maximum, max(1, ceil(max(0.3, prior) * 1.30)))
+        if self.zero_streak >= 3 or estimate < 0.12:
+            if current_stock:
+                return min(maximum, current_stock)
+            interval = min(11, 6 + max(0, self.zero_streak - 3))
+            return 1 if (int(turn) + int(probe_phase)) % interval == 0 else 0
+
+        last = self.last
+        stockout = bool(last and last.censored and last.sold > 0)
+        target = ceil(estimate * (1.75 if stockout else 1.50) + (0.75 if stockout else 0.0))
+        if self.zero_streak:
+            # First or second miss: stop expanding, do not forget the product.
+            target = min(target, max(1, current_stock))
+        return max(0, min(maximum, target))
 
 
 class DemandBook:
