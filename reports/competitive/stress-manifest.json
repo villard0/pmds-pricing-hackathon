@@ -1,0 +1,21 @@
+{
+  "seed_start": 12000,
+  "seed_count": 1,
+  "counts": [
+    16,
+    32
+  ],
+  "profiles": [
+    "competitive",
+    "adaptive",
+    "margin"
+  ],
+  "stress": true,
+  "configs": [
+    "config/default.yaml",
+    "config/scaled_market.yaml",
+    "config/tutorial_pricing.yaml",
+    "config/tutorial_auction.yaml"
+  ],
+  "runs": 72
+}
